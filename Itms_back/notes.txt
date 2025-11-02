@@ -1,0 +1,130 @@
+───────────────────────────────────────────────
+ANPR FRONTEND INTEGRATION GUIDE
+───────────────────────────────────────────────
+
+1.  BASE SETUP
+────────────────
+The backend stack runs entirely on the LPU:
+    • FastAPI server  →  http://localhost:8000
+    • PostgreSQL DB   →  localhost:5432
+    • Detector service posts new detections here
+    • Images are saved under:
+        results/vehicles/
+        results/plates/
+
+You can access all API endpoints over normal HTTP/JSON.
+CORS is enabled so requests from a browser or Node app work directly.
+
+────────────────
+2.  API ENDPOINTS
+────────────────
+# List all detections
+GET  http://localhost:8000/detections
+
+# Get a single detection by id
+GET  http://localhost:8000/detections/{id}
+
+# Retrieve saved images
+GET  http://localhost:8000/images/vehicles/{filename}.jpg
+GET  http://localhost:8000/images/plates/{filename}.jpg
+
+────────────────
+3.  SAMPLE RESPONSE
+────────────────
+GET /detections  →
+[
+  {
+    "id": "02112025_101512",
+    "timestamp": "2025-11-02T18:54:23",
+    "vehicle_conf": 0.94,
+    "plate_conf": 0.83,
+    "ocr_text": "HR26DK8337",
+    "vehicle_path": "results/vehicles/02112025_101512_vehicle.jpg",
+    "plate_path": "results/plates/02112025_101512_plate.jpg"
+  },
+  ...
+]
+
+Each record corresponds to one detected vehicle and its plate.
+
+────────────────
+4.  WHAT TO DISPLAY
+────────────────
+For each detection record show:
+    • Vehicle image (vehicle_path)
+    • Plate image (plate_path)
+    • OCR text (ocr_text)
+    • Timestamp (timestamp)
+    • Vehicle confidence (vehicle_conf)
+    • Plate confidence (plate_conf)
+
+────────────────
+5.  FRONTEND DATA FLOW
+────────────────
+1. Fetch detections periodically:
+       GET /detections
+2. Render them as cards or table rows.
+3. Display vehicle/plate images:
+       <img src="http://localhost:8000/images/vehicles/filename.jpg">
+4. Show OCR text and confidence beside the images.
+5. Refresh every few seconds or provide a “refresh” button.
+
+────────────────
+6.  NODE OR BROWSER ACCESS
+────────────────
+From Node/Express or browser use any HTTP client:
+
+Example (browser / React):
+--------------------------------
+fetch("http://localhost:8000/detections")
+  .then(r => r.json())
+  .then(showData)
+  .catch(console.error);
+
+Example (Node):
+--------------------------------
+import axios from "axios";
+const res = await axios.get("http://localhost:8000/detections");
+console.log(res.data);
+
+No special headers needed. JSON is returned by default.
+
+────────────────
+7.  UI LAYOUT RECOMMENDATION
+────────────────
+• Grid or table view:
+      ┌───────────────────────────────────────────────┐
+      │ Vehicle Image │ Plate Image │ OCR | Time | Conf│
+      └───────────────────────────────────────────────┘
+
+• Auto-refresh or polling every 3–5 seconds.
+• “Not Detected” text when OCR field is empty.
+
+────────────────
+8.  COMMON TROUBLESHOOTING
+────────────────
+• Images not showing → Check FastAPI server is running on :8000
+• Empty OCR text → Plate detected but not readable (normal)
+• DB empty → Detector service not running or not posting
+• CORS errors → Already allowed, but confirm server at :8000
+
+────────────────
+9.  DEPLOYMENT NOTES
+────────────────
+• Everything runs on the LPU.
+• Frontend may run on localhost:3000 (Node/React).
+• FastAPI stays on localhost:8000.
+• PostgreSQL on localhost:5432.
+• When deploying publicly, reverse-proxy both through NGINX.
+
+────────────────
+10.  CONTACT POINTS
+────────────────
+• Detector Service  – produces detections and saves images
+• FastAPI Backend   – stores records, serves data & images
+• PostgreSQL DB     – holds detection metadata
+• GUI Frontend      – displays vehicle, plate, OCR, and timestamp
+
+───────────────────────────────────────────────
+END OF GUIDE
+───────────────────────────────────────────────
