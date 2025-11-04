@@ -26,14 +26,14 @@ os.makedirs("debug", exist_ok=True)
 
 vehicle_detector = VehicleDetector(VEHICLE_MODEL_PATH)
 plate_detector = ANPRDetector(PLATE_MODEL_PATH)
-ocr_engine = SimpleOCRProcessor(OCR_LANGUAGE, use_gpu=False)
-tracker = CentroidTracker(maxDisappeared=50)
+ocr_engine = SimpleOCRProcessor(use_gpu=False)
+tracker = CentroidTracker(max_disappeared=50)
 
 print("[INFO] All models initialized successfully.")
 
 
 # ===========================================================
-# Helper
+# Helper Functions
 # ===========================================================
 def preprocess_plate(img):
     """Mild denoise and upscale before OCR."""
@@ -48,20 +48,30 @@ def preprocess_plate(img):
     return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
 
+def expand_bbox(bbox, image_shape, scale=0.4):
+    """Expand a bounding box by a percentage safely within image bounds."""
+    x1, y1, x2, y2 = map(int, bbox)
+    h, w = image_shape[:2]
+    bw, bh = x2 - x1, y2 - y1
+    pad_w, pad_h = int(bw * scale / 2), int(bh * scale / 2)
+    x1 = max(0, x1 - pad_w)
+    y1 = max(0, y1 - pad_h)
+    x2 = min(w - 1, x2 + pad_w)
+    y2 = min(h - 1, y2 + pad_h)
+    return [x1, y1, x2, y2]
+
+
 # ===========================================================
 # Core Function
 # ===========================================================
 def process_video(video_source=None):
     """
     Process a video or stream for ANPR.
-    Supports:
-      - Local path (e.g. test_video.avi)
-      - Webcam index (0)
-      - Network streams (rtsp/http)
+    Ensures: one plate per vehicle, plate detected only inside vehicle crop.
     """
 
     # -------------------------------
-    # Source resolution
+    # Source setup
     # -------------------------------
     if video_source is None:
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -90,6 +100,9 @@ def process_video(video_source=None):
     frame_count = 0
     tracked = {}
 
+    # ===========================================================
+    # Frame loop
+    # ===========================================================
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -111,27 +124,26 @@ def process_video(video_source=None):
 
         for (objectID, centroid), v in zip(objects.items(), vehicles):
             vid = f"{datetime.now().strftime('%d%m%Y')}_{objectID:03d}"
-            x1, y1, x2, y2 = [int(x) for x in v["bbox"]]
+            x1, y1, x2, y2 = expand_bbox(v["bbox"], frame.shape, scale=0.4)
             conf = v.get("confidence", 0)
-            h, w, _ = frame.shape
-
-            # expand crop slightly
-            pad_w, pad_h = int(0.3 * (x2 - x1)), int(0.3 * (y2 - y1))
-            x1, y1 = max(0, x1 - pad_w), max(0, y1 - pad_h)
-            x2, y2 = min(w, x2 + pad_w), min(h, y2 + pad_h)
             v_crop = frame[y1:y2, x1:x2]
             vehicle_path = os.path.join(VEHICLE_DIR, f"{vid}_vehicle.jpg")
 
-            if objectID not in tracked or conf > tracked[objectID]["vehicle_conf"]:
+            # Save vehicle if new or higher confidence
+            if objectID not in tracked or conf > tracked[objectID].get("vehicle_conf", 0):
                 cv2.imwrite(vehicle_path, v_crop)
                 tracked[objectID] = {
                     "vehicle_conf": conf,
                     "vehicle_path": vehicle_path,
                     "plate_path": "",
+                    "plate_conf": 0,
                     "ocr_text": "",
+                    "plate_assigned": False
                 }
 
-            # PLATE DETECTION
+            # =======================================================
+            # PLATE DETECTION (strictly inside vehicle)
+            # =======================================================
             try:
                 roi_rgb = cv2.cvtColor(v_crop, cv2.COLOR_BGR2RGB)
                 local_plates = plate_detector.detect_number_plates(
@@ -145,29 +157,49 @@ def process_video(video_source=None):
                 continue
 
             best_plate = max(local_plates, key=lambda p: p["confidence"])
-            px1, py1, px2, py2 = [int(x) for x in best_plate["bbox"]]
+            px1, py1, px2, py2 = expand_bbox(best_plate["bbox"], v_crop.shape, scale=0.4)
+            plate_conf = best_plate["confidence"]
+
+            # Skip duplicates or lower-confidence detections
+            if tracked[objectID].get("plate_assigned") and plate_conf <= tracked[objectID].get("plate_conf", 0):
+                continue
+
+            # Physically ensure plate is inside vehicle crop (safety)
+            vx1, vy1, vx2, vy2 = v["bbox"]
+            if not (0 <= px1 < px2 <= (vx2 - vx1) and 0 <= py1 < py2 <= (vy2 - vy1)):
+                continue
+
+            # Crop from vehicle region only
             p_crop = v_crop[py1:py2, px1:px2]
             plate_path = os.path.join(PLATE_DIR, f"{vid}_plate.jpg")
             cv2.imwrite(plate_path, p_crop)
 
-            # OCR
+            tracked[objectID].update({
+                "plate_assigned": True,
+                "plate_conf": plate_conf,
+                "plate_path": plate_path
+            })
+
+            # =======================================================
+            # OCR (Hybrid: Paddle primary, Easy fallback)
+            # =======================================================
             try:
                 prepped = preprocess_plate(p_crop)
-                ocr_result = ocr_engine.extract_text_from_image(prepped, vehicle_id=vid)
+                ocr_result = ocr_engine.extract_text_from_image(prepped)
                 ocr_text = " ".join(ocr_result.get("detected_text", [])).strip()
             except Exception as e:
                 ocr_text = ""
                 print(f"[WARN] OCR failed → {e}")
 
-            if not tracked[objectID]["ocr_text"] or ocr_text != tracked[objectID]["ocr_text"]:
-                tracked[objectID]["plate_path"] = plate_path
+            # Only update if OCR text is new or improved
+            if ocr_text and ocr_text != tracked[objectID].get("ocr_text", ""):
                 tracked[objectID]["ocr_text"] = ocr_text
 
                 detection = {
                     "id": vid,
                     "timestamp": datetime.now().isoformat(),
                     "vehicle_conf": conf,
-                    "plate_conf": best_plate["confidence"],
+                    "plate_conf": plate_conf,
                     "ocr_text": ocr_text,
                     "vehicle_path": vehicle_path,
                     "plate_path": plate_path,
@@ -187,7 +219,7 @@ def process_video(video_source=None):
 
 
 # ===========================================================
-# Entry point
+# Entry Point
 # ===========================================================
 if __name__ == "__main__":
     try:
